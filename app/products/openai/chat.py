@@ -298,7 +298,7 @@ def _log_chat_stream_parse(
         "stop_reason={} frames={} card_frames={} image_chunks={} progress_max={} "
         "soft_stop={} model_response={} model_response_generated_urls={} "
         "model_response_card_json={} render_generated_image_tokens={} "
-        "final_missing_url={} moderated={} card_decode_fail={}",
+        "final_missing_url={} moderated={} card_decode_fail={} system_err_codes={}",
         attempt,
         max_retries,
         model,
@@ -317,6 +317,7 @@ def _log_chat_stream_parse(
         diag.get("final_missing_url", 0),
         diag.get("moderated", 0),
         diag.get("card_decode_fail", 0),
+        diag.get("system_err_codes") or [],
     )
     empty_body = not diag.get("image_count") and not diag.get("text_len")
     suspicious = empty_body and (
@@ -327,13 +328,15 @@ def _log_chat_stream_parse(
         or diag.get("model_response_card_json")
         or diag.get("final_missing_url")
         or diag.get("moderated")
+        or diag.get("system_err_codes")
     )
     if suspicious:
         logger.warning(
             "chat stream empty content with image-related upstream signals: "
-            "model={} stop_reason={} diag={}",
+            "model={} stop_reason={} upstream_image_failed={} diag={}",
             model,
             stop_reason,
+            diag.get("upstream_image_failed"),
             diag,
         )
 
@@ -727,6 +730,17 @@ async def completions(
                                 )
                                 yield f"data: {orjson.dumps(chunk).decode()}\n\n"
 
+                            if (
+                                not adapter.image_urls
+                                and not "".join(adapter.text_buf).strip()
+                            ):
+                                fail_text = adapter.image_generation_failure_message()
+                                if fail_text:
+                                    chunk = make_stream_chunk(
+                                        response_id, model, fail_text
+                                    )
+                                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+
                             references = adapter.references_suffix()
                             if references:
                                 chunk = make_stream_chunk(
@@ -919,6 +933,10 @@ async def completions(
                 if full_text:
                     full_text += "\n\n"
                 full_text += img_text
+    elif not full_text.strip():
+        fail_text = adapter.image_generation_failure_message()
+        if fail_text:
+            full_text = fail_text
 
     references = adapter.references_suffix()
     if references:

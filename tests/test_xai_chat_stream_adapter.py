@@ -227,6 +227,64 @@ class StreamAdapterImageCardTests(unittest.TestCase):
             ],
         )
 
+    def test_system_err_code_without_url_is_recorded(self):
+        adapter = StreamAdapter()
+        adapter.feed(
+            json.dumps(
+                {
+                    "result": {
+                        "response": {
+                            "cardAttachment": {
+                                "jsonData": json.dumps(
+                                    {
+                                        "id": "c1",
+                                        "image_chunk": {
+                                            "progress": 100,
+                                            "imageUuid": "56fcbac3",
+                                            "seq": 1,
+                                            "systemErrCode": "IMG_GEN_FAILED",
+                                        },
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        adapter.feed(
+            json.dumps(
+                {
+                    "result": {
+                        "response": {
+                            "modelResponse": {
+                                "generatedImageUrls": [],
+                                "cardAttachmentsJson": [
+                                    json.dumps(
+                                        {
+                                            "id": "c1",
+                                            "image_chunk": {
+                                                "progress": 100,
+                                                "imageUuid": "56fcbac3",
+                                                "seq": 1,
+                                                "systemErrCode": "IMG_GEN_FAILED",
+                                            },
+                                        }
+                                    )
+                                ],
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        diag = adapter.diagnostics()
+        self.assertEqual(diag["image_count"], 0)
+        self.assertEqual(diag["final_missing_url"], 1)
+        self.assertEqual(diag["system_err_codes"], ["IMG_GEN_FAILED", "IMG_GEN_FAILED"])
+        self.assertTrue(diag["upstream_image_failed"])
+        self.assertIn("systemErrCode=IMG_GEN_FAILED", adapter.image_generation_failure_message())
+
     def test_model_response_generated_image_urls_fallback(self):
         adapter = StreamAdapter()
         events = adapter.feed(

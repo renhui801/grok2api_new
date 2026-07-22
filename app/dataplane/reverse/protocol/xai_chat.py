@@ -314,6 +314,7 @@ class StreamAdapter:
             "model_response_generated_urls": 0,
             "model_response_card_json": 0,
             "render_generated_image_tokens": 0,
+            "system_err_codes": [],
         }
         self.thinking_buf: list[str] = []
         self.text_buf: list[str] = []
@@ -322,8 +323,10 @@ class StreamAdapter:
     def diagnostics(self) -> dict[str, Any]:
         """Compact stream-parse counters for troubleshooting empty image responses."""
         progress_max = self._diag.get("progress_max")
+        system_err_codes = list(self._diag.get("system_err_codes") or [])
         return {
             **self._diag,
+            "system_err_codes": system_err_codes,
             "image_count": len(self.image_urls),
             "text_len": sum(len(part) for part in self.text_buf),
             "thinking_len": sum(len(part) for part in self.thinking_buf),
@@ -331,13 +334,55 @@ class StreamAdapter:
             "saw_image_progress": progress_max is not None,
             "saw_final_image_card": bool(self._diag.get("images_accepted"))
             or bool(self._diag.get("final_missing_url"))
-            or bool(self._diag.get("moderated")),
+            or bool(self._diag.get("moderated"))
+            or bool(system_err_codes),
             "model_response_after_soft_stop_risk": (
                 bool(self._diag.get("soft_stop"))
                 and bool(self._diag.get("model_response"))
                 and len(self.image_urls) == 0
             ),
+            "upstream_image_failed": bool(system_err_codes) and len(self.image_urls) == 0,
         }
+
+    def image_generation_failure_message(self) -> str:
+        """Human-readable message when upstream image generation failed without URL."""
+        codes = [str(code) for code in (self._diag.get("system_err_codes") or []) if code not in (None, "")]
+        if not codes and not self._diag.get("final_missing_url"):
+            return ""
+        if codes:
+            unique = []
+            for code in codes:
+                if code not in unique:
+                    unique.append(code)
+            joined = ", ".join(unique)
+            return (
+                f"Image generation failed upstream (systemErrCode={joined}). "
+                "Please retry with another account or later."
+            )
+        return (
+            "Image generation finished without an image URL. "
+            "Please retry with another account or later."
+        )
+
+    def _record_system_err(self, chunk: dict[str, Any], *, source: str, uuid: str = "") -> None:
+        code = chunk.get("systemErrCode")
+        if code is None:
+            code = chunk.get("system_err_code")
+        if code is None or code == "":
+            return
+        codes = self._diag.setdefault("system_err_codes", [])
+        if not isinstance(codes, list):
+            codes = []
+            self._diag["system_err_codes"] = codes
+        codes.append(code)
+        logger.warning(
+            "stream image systemErrCode: source={} image_id={} code={} progress={} keys={}",
+            source,
+            (uuid or "")[:8],
+            code,
+            chunk.get("progress"),
+            sorted(chunk.keys()),
+        )
 
     # 搜索信源追加：当配置启用且有 webSearchResults 时，格式化为 ## Sources 段落
     # 标记行 [grok2api-sources]: # 是 markdown link reference definition，渲染器不显示，
@@ -644,6 +689,20 @@ class StreamAdapter:
                     self._card_cache[card_id] = card
                 raw_url, uuid = _image_url_from_card_data(card)
                 if not raw_url:
+                    chunk = card.get("image_chunk") or card.get("imageChunk")
+                    if isinstance(chunk, dict):
+                        self._record_system_err(
+                            chunk,
+                            source="modelResponse.cardAttachmentsJson",
+                            uuid=_first_string(chunk, "imageUuid", "image_uuid", "assetId"),
+                        )
+                        if not _first_string(chunk, *_IMAGE_URL_KEYS):
+                            logger.info(
+                                "modelResponse card has no image url: card_id={} progress={} keys={}",
+                                card_id,
+                                chunk.get("progress"),
+                                sorted(chunk.keys()),
+                            )
                     continue
                 ev = self._accept_image(raw_url, uuid)
                 if ev is not None:
@@ -729,10 +788,13 @@ class StreamAdapter:
             raw_url = _first_string(chunk, *_IMAGE_URL_KEYS)
             if not raw_url:
                 self._diag["final_missing_url"] += 1
+                self._record_system_err(chunk, source="image_chunk", uuid=uuid)
                 logger.info(
-                    "final image chunk missing url: image_id={} progress={} keys={}",
+                    "final image chunk missing url: image_id={} progress={} "
+                    "systemErrCode={} keys={}",
                     (uuid or "")[:8],
                     progress_int,
+                    chunk.get("systemErrCode", chunk.get("system_err_code")),
                     sorted(chunk.keys()),
                 )
                 return events
