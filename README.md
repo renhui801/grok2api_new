@@ -243,6 +243,7 @@ basic表示free账号，spuer和heavy 为付费
 
 | 模型名 | mode | 账号等级 | 备注 |
 | :-- | :-- | :-- | :-- |
+| `grok-chat-fast` | fast | basic | Web fast 模式，basic 起选池 |
 | `grok-4.20-fast` / `grok-4.3-fast` | fast | basic（优先高等级） | 
 | `grok-4.20-auto` | auto | super | 
 | `grok-4.20-expert` | expert | super | 
