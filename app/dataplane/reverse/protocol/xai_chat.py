@@ -323,9 +323,6 @@ class StreamAdapter:
         resp = result.get("response")
         if not resp:
             return []
-        nested_error = stream_error_from_payload(resp)
-        if nested_error is not None:
-            raise nested_error
 
         events: list[FrameEvent] = []
 

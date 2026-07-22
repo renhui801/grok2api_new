@@ -92,6 +92,44 @@ class StreamAdapterImageCardTests(unittest.TestCase):
             ],
         )
 
+    def test_nested_response_error_does_not_abort_image_card(self):
+        adapter = StreamAdapter()
+        frame = {
+            "result": {
+                "response": {
+                    "error": {
+                        "message": "You've reached your usage limit. Please try again later."
+                    },
+                    "cardAttachment": {
+                        "jsonData": json.dumps(
+                            {
+                                "id": "image_card",
+                                "image_chunk": {
+                                    "progress": 100,
+                                    "imageUuid": "image_3",
+                                    "imageUrl": "users/user_1/generated/final/image.jpg",
+                                    "moderated": False,
+                                },
+                            }
+                        )
+                    },
+                }
+            }
+        }
+
+        events = adapter.feed(json.dumps(frame))
+
+        self.assertEqual([event.kind for event in events], ["image_progress", "image"])
+        self.assertEqual(
+            adapter.image_urls,
+            [
+                (
+                    "https://assets.grok.com/users/user_1/generated/final/image.jpg",
+                    "image_3",
+                )
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
