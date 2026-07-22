@@ -192,6 +192,21 @@ _GROK_RENDER_RE = re.compile(
 
 _IMAGE_BASE = "https://assets.grok.com/"
 
+
+def _first_string(source: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _image_asset_url(raw_url: str) -> str:
+    if raw_url.startswith(("http://", "https://")):
+        return raw_url
+    return _IMAGE_BASE + raw_url.lstrip("/")
+
+
 # 工具使用卡片 → emoji 单行格式化映射（详细模式专用）
 # 格式: tool_name → (emoji, (可展示的参数 key 列表))
 _TOOL_FMT: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -308,6 +323,9 @@ class StreamAdapter:
         resp = result.get("response")
         if not resp:
             return []
+        nested_error = stream_error_from_payload(resp)
+        if nested_error is not None:
+            raise nested_error
 
         events: list[FrameEvent] = []
 
@@ -315,6 +333,15 @@ class StreamAdapter:
         card_raw = resp.get("cardAttachment")
         if card_raw:
             events.extend(self._handle_card(card_raw))
+        card_list = resp.get("cardAttachments")
+        if isinstance(card_list, list):
+            for item in card_list:
+                if isinstance(item, dict):
+                    events.extend(self._handle_card(item))
+
+        image_response = resp.get("streamingImageGenerationResponse")
+        if isinstance(image_response, dict):
+            events.extend(self._handle_image_chunk(image_response))
 
         # ── 采集 webSearchResults（搜索信源，多帧累积去重）───────
         wsr = resp.get("webSearchResults")
@@ -461,31 +488,60 @@ class StreamAdapter:
 
     def _handle_card(self, card_raw: dict) -> list[FrameEvent]:
         """Cache card data; emit image event on progress=100."""
-        try:
-            jd = orjson.loads(card_raw["jsonData"])
-        except (orjson.JSONDecodeError, ValueError, TypeError, KeyError):
+        jd = self._decode_card_json(card_raw)
+        if jd is None:
             return []
 
         card_id = jd.get("id", "")
         self._card_cache[card_id] = jd
 
-        chunk = jd.get("image_chunk")
-        if chunk:
-            progress = chunk.get("progress")
-            uuid = chunk.get("imageUuid", "")
-            events: list[FrameEvent] = []
-            try:
-                if progress is not None:
-                    events.append(FrameEvent("image_progress", str(int(progress)), uuid))
-            except (TypeError, ValueError):
-                pass
-            if chunk.get("progress") == 100 and not chunk.get("moderated"):
-                url = _IMAGE_BASE + chunk["imageUrl"]
-                self.image_urls.append((url, uuid))
-                events.append(FrameEvent("image", url, uuid))
-            return events
+        chunk = jd.get("image_chunk") or jd.get("imageChunk")
+        if isinstance(chunk, dict):
+            return self._handle_image_chunk(chunk)
 
         return []
+
+    @staticmethod
+    def _decode_card_json(card_raw: dict[str, Any]) -> dict[str, Any] | None:
+        raw = card_raw.get("jsonData")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw:
+            try:
+                jd = orjson.loads(raw)
+            except (orjson.JSONDecodeError, ValueError, TypeError):
+                return None
+            return jd if isinstance(jd, dict) else None
+        if card_raw.get("image_chunk") or card_raw.get("imageChunk"):
+            return card_raw
+        return None
+
+    def _handle_image_chunk(self, chunk: dict[str, Any]) -> list[FrameEvent]:
+        events: list[FrameEvent] = []
+        progress = chunk.get("progress")
+        uuid = _first_string(chunk, "imageUuid", "image_uuid", "assetId")
+        progress_int: int | None = None
+        try:
+            if progress is not None:
+                progress_int = int(progress)
+                events.append(FrameEvent("image_progress", str(progress_int), uuid))
+        except (TypeError, ValueError):
+            pass
+
+        is_final = progress_int is not None and progress_int >= 100
+        if chunk.get("isFinal") is True:
+            is_final = True
+        if is_final and not chunk.get("moderated"):
+            raw_url = _first_string(chunk, "imageUrl", "image_url", "url")
+            if not raw_url:
+                logger.debug("final image chunk missing url: keys={}", sorted(chunk.keys()))
+                return events
+            url = _image_asset_url(raw_url)
+            item = (url, uuid)
+            if item not in self.image_urls:
+                self.image_urls.append(item)
+                events.append(FrameEvent("image", url, uuid))
+        return events
 
     # ------------------------------------------------------------------
     # Token cleaning — <grok:render> → markdown
