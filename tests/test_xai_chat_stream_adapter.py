@@ -21,6 +21,7 @@ _clear_previous_app_stubs()
 
 logger_stub = types.SimpleNamespace(
     debug=lambda *args, **kwargs: None,
+    info=lambda *args, **kwargs: None,
     warning=lambda *args, **kwargs: None,
 )
 sys.modules["app.platform.logging.logger"] = types.SimpleNamespace(logger=logger_stub)
@@ -129,6 +130,72 @@ class StreamAdapterImageCardTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_diagnostics_track_empty_image_signals(self):
+        adapter = StreamAdapter()
+        adapter.feed(
+            json.dumps(
+                {
+                    "result": {
+                        "response": {
+                            "messageTag": "final",
+                            "token": (
+                                '<grok:render card_id="c1" card_type="generated_image_card" '
+                                'type="render_generated_image"></grok:render>'
+                            ),
+                            "isThinking": False,
+                        }
+                    }
+                }
+            )
+        )
+        adapter.feed(
+            json.dumps(
+                {
+                    "result": {
+                        "response": {
+                            "cardAttachment": {
+                                "jsonData": json.dumps(
+                                    {
+                                        "id": "c1",
+                                        "image_chunk": {
+                                            "progress": 100,
+                                            "imageUuid": "img",
+                                            "moderated": False,
+                                        },
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        adapter.feed(
+            json.dumps(
+                {
+                    "result": {
+                        "response": {
+                            "isSoftStop": True,
+                            "modelResponse": {
+                                "generatedImageUrls": [],
+                                "cardAttachmentsJson": ['{"id":"c1"}'],
+                            },
+                        }
+                    }
+                }
+            )
+        )
+
+        diag = adapter.diagnostics()
+        self.assertEqual(diag["image_count"], 0)
+        self.assertEqual(diag["render_generated_image_tokens"], 1)
+        self.assertEqual(diag["card_frames"], 1)
+        self.assertEqual(diag["final_missing_url"], 1)
+        self.assertEqual(diag["soft_stop"], 1)
+        self.assertEqual(diag["model_response"], 1)
+        self.assertEqual(diag["model_response_card_json"], 1)
+        self.assertTrue(diag["model_response_after_soft_stop_risk"])
 
 
 if __name__ == "__main__":

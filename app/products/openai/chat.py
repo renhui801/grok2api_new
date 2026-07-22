@@ -283,6 +283,61 @@ def _normalize_image_format(value: str | None) -> str:
     return fmt
 
 
+def _log_chat_stream_parse(
+    *,
+    model: str,
+    attempt: int,
+    max_retries: int,
+    adapter: StreamAdapter,
+    stop_reason: str,
+) -> None:
+    """Log stream-parse diagnostics; warn when completion looks empty for image gen."""
+    diag = adapter.diagnostics()
+    logger.info(
+        "chat stream completed: attempt={}/{} model={} image_count={} text_len={} "
+        "stop_reason={} frames={} card_frames={} image_chunks={} progress_max={} "
+        "soft_stop={} model_response={} model_response_generated_urls={} "
+        "model_response_card_json={} render_generated_image_tokens={} "
+        "final_missing_url={} moderated={} card_decode_fail={}",
+        attempt,
+        max_retries,
+        model,
+        diag.get("image_count", 0),
+        diag.get("text_len", 0),
+        stop_reason,
+        diag.get("frames", 0),
+        diag.get("card_frames", 0),
+        diag.get("image_chunk_frames", 0),
+        diag.get("progress_max"),
+        diag.get("soft_stop", 0),
+        diag.get("model_response", 0),
+        diag.get("model_response_generated_urls", 0),
+        diag.get("model_response_card_json", 0),
+        diag.get("render_generated_image_tokens", 0),
+        diag.get("final_missing_url", 0),
+        diag.get("moderated", 0),
+        diag.get("card_decode_fail", 0),
+    )
+    empty_body = not diag.get("image_count") and not diag.get("text_len")
+    suspicious = empty_body and (
+        diag.get("card_frames")
+        or diag.get("image_chunk_frames")
+        or diag.get("render_generated_image_tokens")
+        or diag.get("model_response_generated_urls")
+        or diag.get("model_response_card_json")
+        or diag.get("final_missing_url")
+        or diag.get("moderated")
+    )
+    if suspicious:
+        logger.warning(
+            "chat stream empty content with image-related upstream signals: "
+            "model={} stop_reason={} diag={}",
+            model,
+            stop_reason,
+            diag,
+        )
+
+
 # 精确匹配 grok2api 注入的 Sources 段落（含标记行），用于多轮对话剥离
 _SOURCES_STRIP_RE = re.compile(
     r"(?:^|\r?\n\r?\n)## Sources\r?\n\[grok2api-sources\]: #\r?\n[\s\S]*$"
@@ -538,6 +593,7 @@ async def completions(
                 try:
                     try:
                         ended = False
+                        stop_reason = "eof"
                         sieve = ToolSieve(tool_names)
                         tool_calls_emitted = False
                         yield ": heartbeat\n\n"
@@ -552,6 +608,7 @@ async def completions(
                         ):
                             event_type, data = classify_line(line)
                             if event_type == "done":
+                                stop_reason = "done"
                                 break
                             if event_type != "data" or not data:
                                 continue
@@ -586,6 +643,7 @@ async def completions(
                                             yield "data: [DONE]\n\n"
                                             tool_calls_emitted = True
                                             success = True
+                                            stop_reason = "tool_calls"
                                             logger.info(
                                                 "chat stream tool_calls: attempt={}/{} model={} call_count={}",
                                                 attempt + 1,
@@ -608,6 +666,20 @@ async def completions(
                                 elif ev.kind == "annotation" and ev.annotation_data:
                                     collected_annotations.append(ev.annotation_data)
                                 elif ev.kind == "soft_stop":
+                                    stop_reason = "soft_stop"
+                                    soft_diag = adapter.diagnostics()
+                                    logger.info(
+                                        "chat stream soft_stop: model={} image_count={} "
+                                        "text_len={} progress_max={} card_frames={} "
+                                        "model_response={} render_generated_image_tokens={}",
+                                        model,
+                                        soft_diag.get("image_count", 0),
+                                        soft_diag.get("text_len", 0),
+                                        soft_diag.get("progress_max"),
+                                        soft_diag.get("card_frames", 0),
+                                        soft_diag.get("model_response", 0),
+                                        soft_diag.get("render_generated_image_tokens", 0),
+                                    )
                                     ended = True
                                     break
                             if ended:
@@ -639,6 +711,7 @@ async def completions(
                                 yield "data: [DONE]\n\n"
                                 tool_calls_emitted = True
                                 success = True
+                                stop_reason = "tool_calls_flushed"
                                 logger.info(
                                     "chat stream tool_calls (flushed): model={} call_count={}",
                                     model,
@@ -675,12 +748,12 @@ async def completions(
                             yield f"data: {orjson.dumps(final).decode()}\n\n"
                             yield "data: [DONE]\n\n"
                             success = True
-                            logger.info(
-                                "chat stream completed: attempt={}/{} model={} image_count={}",
-                                attempt + 1,
-                                max_retries + 1,
-                                model,
-                                len(adapter.image_urls),
+                            _log_chat_stream_parse(
+                                model=model,
+                                attempt=attempt + 1,
+                                max_retries=max_retries + 1,
+                                adapter=adapter,
+                                stop_reason=stop_reason,
                             )
 
                     except UpstreamError as exc:
@@ -757,6 +830,7 @@ async def completions(
 
         try:
             try:
+                stop_reason = "eof"
                 async for line in _stream_chat(
                     token=token,
                     mode_id=ModeId(selected_mode_id),
@@ -768,17 +842,26 @@ async def completions(
                 ):
                     event_type, data = classify_line(line)
                     if event_type == "done":
+                        stop_reason = "done"
                         break
                     if event_type != "data" or not data:
                         continue
                     ended = False
                     for ev in adapter.feed(data):
                         if ev.kind == "soft_stop":
+                            stop_reason = "soft_stop"
                             ended = True
                             break
                     if ended:
                         break
                 success = True
+                _log_chat_stream_parse(
+                    model=model,
+                    attempt=attempt + 1,
+                    max_retries=max_retries + 1,
+                    adapter=adapter,
+                    stop_reason=stop_reason,
+                )
 
             except UpstreamError as exc:
                 fail_exc = exc

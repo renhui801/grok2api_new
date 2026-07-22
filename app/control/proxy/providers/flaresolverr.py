@@ -15,6 +15,18 @@ def _extract_all_cookies(cookies: list[dict]) -> str:
     return "; ".join(f"{c.get('name')}={c.get('value')}" for c in cookies)
 
 
+def _proxy_url_for_flaresolverr(proxy_url: str) -> str:
+    """Rewrite localhost proxy URLs so Dockerized FlareSolverr can reach the host."""
+    parsed = urlparse(proxy_url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost"}:
+        return proxy_url
+    rewritten = proxy_url
+    if parsed.hostname:
+        rewritten = rewritten.replace(parsed.hostname, "host.docker.internal", 1)
+    return rewritten
+
+
 class FlareSolverrClearanceProvider:
     """Refresh CF clearance bundles via a FlareSolverr instance."""
 
@@ -71,7 +83,8 @@ class FlareSolverrClearanceProvider:
             "maxTimeout": timeout_sec * 1000,
         }
         if proxy_url:
-            payload["proxy"] = {"url": proxy_url}
+            # FlareSolverr 常跑在 Docker 内；把指向本机的代理改写成容器可访问地址。
+            payload["proxy"] = {"url": _proxy_url_for_flaresolverr(proxy_url)}
 
         body    = json.dumps(payload).encode()
         request = urllib_request.Request(

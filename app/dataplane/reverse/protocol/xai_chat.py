@@ -244,6 +244,7 @@ class StreamAdapter:
         "_content_started",
         "_web_search_results",
         "_web_search_urls_seen",
+        "_diag",
         "thinking_buf",
         "text_buf",
         "image_urls",
@@ -265,9 +266,45 @@ class StreamAdapter:
         self._reasoning = ReasoningAggregator() if self._summary_mode else None
         self._web_search_results: list[dict] = []
         self._web_search_urls_seen: set[str] = set()
+        self._diag: dict[str, Any] = {
+            "frames": 0,
+            "card_frames": 0,
+            "card_decode_fail": 0,
+            "image_chunk_frames": 0,
+            "progress_max": None,
+            "final_missing_url": 0,
+            "moderated": 0,
+            "images_accepted": 0,
+            "soft_stop": 0,
+            "final_metadata": 0,
+            "model_response": 0,
+            "model_response_generated_urls": 0,
+            "model_response_card_json": 0,
+            "render_generated_image_tokens": 0,
+        }
         self.thinking_buf: list[str] = []
         self.text_buf: list[str] = []
         self.image_urls: list[tuple[str, str]] = []   # [(url, imageUuid), ...]
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Compact stream-parse counters for troubleshooting empty image responses."""
+        progress_max = self._diag.get("progress_max")
+        return {
+            **self._diag,
+            "image_count": len(self.image_urls),
+            "text_len": sum(len(part) for part in self.text_buf),
+            "thinking_len": sum(len(part) for part in self.thinking_buf),
+            "card_cache_size": len(self._card_cache),
+            "saw_image_progress": progress_max is not None,
+            "saw_final_image_card": bool(self._diag.get("images_accepted"))
+            or bool(self._diag.get("final_missing_url"))
+            or bool(self._diag.get("moderated")),
+            "model_response_after_soft_stop_risk": (
+                bool(self._diag.get("soft_stop"))
+                and bool(self._diag.get("model_response"))
+                and len(self.image_urls) == 0
+            ),
+        }
 
     # 搜索信源追加：当配置启用且有 webSearchResults 时，格式化为 ## Sources 段落
     # 标记行 [grok2api-sources]: # 是 markdown link reference definition，渲染器不显示，
@@ -325,15 +362,41 @@ class StreamAdapter:
             return []
 
         events: list[FrameEvent] = []
+        self._diag["frames"] += 1
+
+        # ── observe modelResponse (not consumed for images yet) ───
+        model_response = resp.get("modelResponse")
+        if isinstance(model_response, dict):
+            self._diag["model_response"] += 1
+            generated = model_response.get("generatedImageUrls")
+            if isinstance(generated, list):
+                self._diag["model_response_generated_urls"] = max(
+                    int(self._diag["model_response_generated_urls"]),
+                    sum(1 for item in generated if isinstance(item, str) and item),
+                )
+            cards = model_response.get("cardAttachmentsJson")
+            if isinstance(cards, list):
+                self._diag["model_response_card_json"] = max(
+                    int(self._diag["model_response_card_json"]),
+                    len(cards),
+                )
+            logger.debug(
+                "stream modelResponse observed: generated_urls={} card_json={} image_count={}",
+                self._diag["model_response_generated_urls"],
+                self._diag["model_response_card_json"],
+                len(self.image_urls),
+            )
 
         # ── cache every cardAttachment first ──────────────────────
         card_raw = resp.get("cardAttachment")
         if card_raw:
+            self._diag["card_frames"] += 1
             events.extend(self._handle_card(card_raw))
         card_list = resp.get("cardAttachments")
         if isinstance(card_list, list):
             for item in card_list:
                 if isinstance(item, dict):
+                    self._diag["card_frames"] += 1
                     events.extend(self._handle_card(item))
 
         image_response = resp.get("streamingImageGenerationResponse")
@@ -452,7 +515,10 @@ class StreamAdapter:
         # ── final text token (needs cleaning) ─────────────────────
         if token is not None and think is not True and tag == "final":
             self._content_started = True
-            cleaned, local_anns = self._clean_token(token)
+            token_text = str(token)
+            if "render_generated_image" in token_text:
+                self._diag["render_generated_image_tokens"] += 1
+            cleaned, local_anns = self._clean_token(token_text)
             if cleaned:
                 # 先发 text 事件（OpenAI 顺序：text.delta 先，annotation.added 后）
                 self.text_buf.append(cleaned)
@@ -464,15 +530,23 @@ class StreamAdapter:
                     self._annotations.append(ann)
                     events.append(FrameEvent("annotation", annotation_data=ann))
                 self._text_offset += len(cleaned)
+            elif "render_generated_image" in token_text:
+                logger.debug(
+                    "generated_image render token cleaned to empty: card_cache={} image_count={}",
+                    len(self._card_cache),
+                    len(self.image_urls),
+                )
             return events
 
         # ── end signals ───────────────────────────────────────────
         if resp.get("isSoftStop"):
+            self._diag["soft_stop"] += 1
             self._flush_pending_reasoning(events)
             events.append(FrameEvent("soft_stop"))
             return events
 
         if resp.get("finalMetadata"):
+            self._diag["final_metadata"] += 1
             self._flush_pending_reasoning(events)
             events.append(FrameEvent("soft_stop"))
             return events
@@ -487,6 +561,11 @@ class StreamAdapter:
         """Cache card data; emit image event on progress=100."""
         jd = self._decode_card_json(card_raw)
         if jd is None:
+            self._diag["card_decode_fail"] += 1
+            logger.info(
+                "stream cardAttachment decode failed: raw_keys={}",
+                sorted(card_raw.keys()) if isinstance(card_raw, dict) else type(card_raw).__name__,
+            )
             return []
 
         card_id = jd.get("id", "")
@@ -496,6 +575,12 @@ class StreamAdapter:
         if isinstance(chunk, dict):
             return self._handle_image_chunk(chunk)
 
+        logger.debug(
+            "stream cardAttachment without image_chunk: card_id={} type={} keys={}",
+            card_id,
+            jd.get("type") or jd.get("cardType") or "",
+            sorted(jd.keys()),
+        )
         return []
 
     @staticmethod
@@ -515,12 +600,16 @@ class StreamAdapter:
 
     def _handle_image_chunk(self, chunk: dict[str, Any]) -> list[FrameEvent]:
         events: list[FrameEvent] = []
+        self._diag["image_chunk_frames"] += 1
         progress = chunk.get("progress")
         uuid = _first_string(chunk, "imageUuid", "image_uuid", "assetId")
         progress_int: int | None = None
         try:
             if progress is not None:
                 progress_int = int(progress)
+                prev = self._diag.get("progress_max")
+                if prev is None or progress_int > int(prev):
+                    self._diag["progress_max"] = progress_int
                 events.append(FrameEvent("image_progress", str(progress_int), uuid))
         except (TypeError, ValueError):
             pass
@@ -528,16 +617,38 @@ class StreamAdapter:
         is_final = progress_int is not None and progress_int >= 100
         if chunk.get("isFinal") is True:
             is_final = True
+        if is_final and chunk.get("moderated"):
+            self._diag["moderated"] += 1
+            logger.info(
+                "stream image chunk moderated: image_id={} progress={} keys={}",
+                (uuid or "")[:8],
+                progress_int,
+                sorted(chunk.keys()),
+            )
+            return events
         if is_final and not chunk.get("moderated"):
             raw_url = _first_string(chunk, "imageUrl", "image_url", "url")
             if not raw_url:
-                logger.debug("final image chunk missing url: keys={}", sorted(chunk.keys()))
+                self._diag["final_missing_url"] += 1
+                logger.info(
+                    "final image chunk missing url: image_id={} progress={} keys={}",
+                    (uuid or "")[:8],
+                    progress_int,
+                    sorted(chunk.keys()),
+                )
                 return events
             url = _image_asset_url(raw_url)
             item = (url, uuid)
             if item not in self.image_urls:
                 self.image_urls.append(item)
+                self._diag["images_accepted"] += 1
                 events.append(FrameEvent("image", url, uuid))
+                logger.info(
+                    "stream image accepted: image_id={} progress={} image_count={}",
+                    (uuid or "")[:8],
+                    progress_int,
+                    len(self.image_urls),
+                )
         return events
 
     # ------------------------------------------------------------------
