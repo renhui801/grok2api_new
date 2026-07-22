@@ -13,6 +13,7 @@ MODELS: tuple[ModelSpec, ...] = (
     # === Chat ==============================================================
 
     # Basic fast; auto/expert require Super+
+    ModelSpec("grok-chat-fast",                         ModeId.FAST,     Tier.BASIC, Capability.CHAT,       True, "Grok Chat Fast"),
     ModelSpec("grok-4.20-0309-non-reasoning",           ModeId.FAST,     Tier.BASIC, Capability.CHAT,       True, "Grok 4.20 0309 Non-Reasoning"),
     ModelSpec("grok-4.20-0309",                         ModeId.AUTO,     Tier.SUPER, Capability.CHAT,       True, "Grok 4.20 0309"),
     ModelSpec("grok-4.20-0309-reasoning",               ModeId.EXPERT,   Tier.SUPER, Capability.CHAT,       True, "Grok 4.20 0309 Reasoning"),
