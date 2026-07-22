@@ -44,7 +44,7 @@ services:
   # ── grok2api ──────────────────────────────────────────────────────────────
   grok2api:
     image: ghcr.io/renhui801/grok2api_new:latest
-    container_name: grok2api
+    container_name: grok2api_new
     restart: unless-stopped
     ports:
       - "${HOST_PORT:-8000}:${SERVER_PORT:-8000}"
