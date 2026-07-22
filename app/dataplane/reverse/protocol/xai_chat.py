@@ -193,6 +193,19 @@ _GROK_RENDER_RE = re.compile(
 _IMAGE_BASE = "https://assets.grok.com/"
 
 
+_IMAGE_URL_KEYS = (
+    "imageUrl",
+    "image_url",
+    "url",
+    "imageUri",
+    "image_uri",
+    "assetUrl",
+    "asset_url",
+    "fileUri",
+    "file_uri",
+)
+
+
 def _first_string(source: dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = source.get(key)
@@ -205,6 +218,26 @@ def _image_asset_url(raw_url: str) -> str:
     if raw_url.startswith(("http://", "https://")):
         return raw_url
     return _IMAGE_BASE + raw_url.lstrip("/")
+
+
+def _image_url_from_card_data(data: dict[str, Any]) -> tuple[str, str]:
+    """Return (raw_url, image_uuid) from card JSON, matching reference chat.go behavior."""
+    chunk = data.get("image_chunk") or data.get("imageChunk")
+    if not isinstance(chunk, dict):
+        return "", ""
+    if chunk.get("moderated"):
+        return "", ""
+    progress = chunk.get("progress")
+    try:
+        progress_int = int(progress) if progress is not None else None
+    except (TypeError, ValueError):
+        progress_int = None
+    is_final = (progress_int is not None and progress_int >= 100) or chunk.get("isFinal") is True
+    if not is_final:
+        return "", ""
+    raw_url = _first_string(chunk, *_IMAGE_URL_KEYS)
+    uuid = _first_string(chunk, "imageUuid", "image_uuid", "assetId")
+    return raw_url, uuid
 
 
 # 工具使用卡片 → emoji 单行格式化映射（详细模式专用）
@@ -364,7 +397,7 @@ class StreamAdapter:
         events: list[FrameEvent] = []
         self._diag["frames"] += 1
 
-        # ── observe modelResponse (not consumed for images yet) ───
+        # ── observe + collect modelResponse images (fallback) ─────
         model_response = resp.get("modelResponse")
         if isinstance(model_response, dict):
             self._diag["model_response"] += 1
@@ -380,10 +413,14 @@ class StreamAdapter:
                     int(self._diag["model_response_card_json"]),
                     len(cards),
                 )
-            logger.debug(
-                "stream modelResponse observed: generated_urls={} card_json={} image_count={}",
+            before = len(self.image_urls)
+            events.extend(self._collect_model_response_images(model_response))
+            logger.info(
+                "stream modelResponse observed: generated_urls={} card_json={} "
+                "accepted_delta={} image_count={}",
                 self._diag["model_response_generated_urls"],
                 self._diag["model_response_card_json"],
+                len(self.image_urls) - before,
                 len(self.image_urls),
             )
 
@@ -557,6 +594,68 @@ class StreamAdapter:
     # Card attachment handling
     # ------------------------------------------------------------------
 
+    def _accept_image(self, raw_url: str, uuid: str = "") -> FrameEvent | None:
+        if not raw_url:
+            return None
+        url = _image_asset_url(raw_url)
+        item = (url, uuid or "")
+        if item in self.image_urls:
+            return None
+        # Prefer richer uuid when same URL was stored with empty id.
+        for index, (existing_url, existing_uuid) in enumerate(self.image_urls):
+            if existing_url == url and not existing_uuid and uuid:
+                self.image_urls[index] = item
+                return None
+        self.image_urls.append(item)
+        self._diag["images_accepted"] += 1
+        return FrameEvent("image", url, uuid or "")
+
+    def _collect_model_response_images(self, model_response: dict[str, Any]) -> list[FrameEvent]:
+        """Fallback image collection from final modelResponse (reference chat.go)."""
+        events: list[FrameEvent] = []
+        generated = model_response.get("generatedImageUrls")
+        if isinstance(generated, list):
+            for item in generated:
+                if isinstance(item, str) and item:
+                    ev = self._accept_image(item)
+                    if ev is not None:
+                        events.append(ev)
+                        logger.info(
+                            "stream image accepted from modelResponse.generatedImageUrls: image_count={}",
+                            len(self.image_urls),
+                        )
+        cards = model_response.get("cardAttachmentsJson")
+        if isinstance(cards, list):
+            for raw in cards:
+                card: dict[str, Any] | None = None
+                if isinstance(raw, dict):
+                    card = raw
+                elif isinstance(raw, str) and raw:
+                    try:
+                        parsed = orjson.loads(raw)
+                    except (orjson.JSONDecodeError, ValueError, TypeError):
+                        continue
+                    if isinstance(parsed, dict):
+                        card = parsed
+                if not card:
+                    continue
+                card_id = str(card.get("id") or "")
+                if card_id:
+                    self._card_cache[card_id] = card
+                raw_url, uuid = _image_url_from_card_data(card)
+                if not raw_url:
+                    continue
+                ev = self._accept_image(raw_url, uuid)
+                if ev is not None:
+                    events.append(ev)
+                    logger.info(
+                        "stream image accepted from modelResponse.cardAttachmentsJson: "
+                        "image_id={} image_count={}",
+                        (uuid or "")[:8],
+                        len(self.image_urls),
+                    )
+        return events
+
     def _handle_card(self, card_raw: dict) -> list[FrameEvent]:
         """Cache card data; emit image event on progress=100."""
         jd = self._decode_card_json(card_raw)
@@ -627,7 +726,7 @@ class StreamAdapter:
             )
             return events
         if is_final and not chunk.get("moderated"):
-            raw_url = _first_string(chunk, "imageUrl", "image_url", "url")
+            raw_url = _first_string(chunk, *_IMAGE_URL_KEYS)
             if not raw_url:
                 self._diag["final_missing_url"] += 1
                 logger.info(
@@ -637,12 +736,9 @@ class StreamAdapter:
                     sorted(chunk.keys()),
                 )
                 return events
-            url = _image_asset_url(raw_url)
-            item = (url, uuid)
-            if item not in self.image_urls:
-                self.image_urls.append(item)
-                self._diag["images_accepted"] += 1
-                events.append(FrameEvent("image", url, uuid))
+            ev = self._accept_image(raw_url, uuid)
+            if ev is not None:
+                events.append(ev)
                 logger.info(
                     "stream image accepted: image_id={} progress={} image_count={}",
                     (uuid or "")[:8],

@@ -177,10 +177,33 @@ class StreamAdapterImageCardTests(unittest.TestCase):
                     "result": {
                         "response": {
                             "isSoftStop": True,
+                        }
+                    }
+                }
+            )
+        )
+        # soft_stop 之后的 modelResponse 兜底出图
+        events = adapter.feed(
+            json.dumps(
+                {
+                    "result": {
+                        "response": {
                             "modelResponse": {
                                 "generatedImageUrls": [],
-                                "cardAttachmentsJson": ['{"id":"c1"}'],
-                            },
+                                "cardAttachmentsJson": [
+                                    json.dumps(
+                                        {
+                                            "id": "c1",
+                                            "image_chunk": {
+                                                "progress": 100,
+                                                "imageUuid": "img",
+                                                "imageUrl": "users/u1/generated/final/image.jpg",
+                                                "moderated": False,
+                                            },
+                                        }
+                                    )
+                                ],
+                            }
                         }
                     }
                 }
@@ -188,14 +211,50 @@ class StreamAdapterImageCardTests(unittest.TestCase):
         )
 
         diag = adapter.diagnostics()
-        self.assertEqual(diag["image_count"], 0)
-        self.assertEqual(diag["render_generated_image_tokens"], 1)
-        self.assertEqual(diag["card_frames"], 1)
         self.assertEqual(diag["final_missing_url"], 1)
         self.assertEqual(diag["soft_stop"], 1)
         self.assertEqual(diag["model_response"], 1)
         self.assertEqual(diag["model_response_card_json"], 1)
-        self.assertTrue(diag["model_response_after_soft_stop_risk"])
+        self.assertEqual(diag["image_count"], 1)
+        self.assertEqual([event.kind for event in events], ["image"])
+        self.assertEqual(
+            adapter.image_urls,
+            [
+                (
+                    "https://assets.grok.com/users/u1/generated/final/image.jpg",
+                    "img",
+                )
+            ],
+        )
+
+    def test_model_response_generated_image_urls_fallback(self):
+        adapter = StreamAdapter()
+        events = adapter.feed(
+            json.dumps(
+                {
+                    "result": {
+                        "response": {
+                            "modelResponse": {
+                                "generatedImageUrls": [
+                                    "users/u1/generated/a/image.jpg"
+                                ],
+                                "cardAttachmentsJson": [],
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        self.assertEqual([event.kind for event in events], ["image"])
+        self.assertEqual(
+            adapter.image_urls,
+            [
+                (
+                    "https://assets.grok.com/users/u1/generated/a/image.jpg",
+                    "",
+                )
+            ],
+        )
 
 
 if __name__ == "__main__":

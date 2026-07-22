@@ -443,8 +443,8 @@ async def create(
                                     })
 
                             elif ev.kind == "soft_stop":
-                                ended = True
-                                break
+                                # soft_stop 后仍可能有 modelResponse 出图帧，继续读到 EOF/DONE。
+                                pass
 
                         if ended:
                             break
@@ -655,13 +655,10 @@ async def create(
                         break
                     if event_type != "data" or not data:
                         continue
-                    ended = False
                     for ev in adapter.feed(data):
                         if ev.kind == "soft_stop":
-                            ended = True
-                            break
-                    if ended:
-                        break
+                            # soft_stop 后继续读取，等待 modelResponse 兜底出图。
+                            pass
                 success = True
 
             except UpstreamError as exc:

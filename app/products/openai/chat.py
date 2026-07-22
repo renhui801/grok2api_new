@@ -666,22 +666,23 @@ async def completions(
                                 elif ev.kind == "annotation" and ev.annotation_data:
                                     collected_annotations.append(ev.annotation_data)
                                 elif ev.kind == "soft_stop":
-                                    stop_reason = "soft_stop"
-                                    soft_diag = adapter.diagnostics()
-                                    logger.info(
-                                        "chat stream soft_stop: model={} image_count={} "
-                                        "text_len={} progress_max={} card_frames={} "
-                                        "model_response={} render_generated_image_tokens={}",
-                                        model,
-                                        soft_diag.get("image_count", 0),
-                                        soft_diag.get("text_len", 0),
-                                        soft_diag.get("progress_max"),
-                                        soft_diag.get("card_frames", 0),
-                                        soft_diag.get("model_response", 0),
-                                        soft_diag.get("render_generated_image_tokens", 0),
-                                    )
-                                    ended = True
-                                    break
+                                    # soft_stop 后仍可能有 modelResponse 兜底出图帧，继续读到 EOF/DONE。
+                                    if stop_reason != "soft_stop":
+                                        stop_reason = "soft_stop"
+                                        soft_diag = adapter.diagnostics()
+                                        logger.info(
+                                            "chat stream soft_stop: model={} image_count={} "
+                                            "text_len={} progress_max={} card_frames={} "
+                                            "model_response={} render_generated_image_tokens={} "
+                                            "continuing_for_model_response=true",
+                                            model,
+                                            soft_diag.get("image_count", 0),
+                                            soft_diag.get("text_len", 0),
+                                            soft_diag.get("progress_max"),
+                                            soft_diag.get("card_frames", 0),
+                                            soft_diag.get("model_response", 0),
+                                            soft_diag.get("render_generated_image_tokens", 0),
+                                        )
                             if ended:
                                 break
 
@@ -846,14 +847,11 @@ async def completions(
                         break
                     if event_type != "data" or not data:
                         continue
-                    ended = False
                     for ev in adapter.feed(data):
                         if ev.kind == "soft_stop":
-                            stop_reason = "soft_stop"
-                            ended = True
-                            break
-                    if ended:
-                        break
+                            # 继续读取，等待可能出现的 modelResponse 出图兜底。
+                            if stop_reason != "soft_stop":
+                                stop_reason = "soft_stop"
                 success = True
                 _log_chat_stream_parse(
                     model=model,
