@@ -1,0 +1,97 @@
+import json
+import sys
+import types
+import unittest
+
+
+def _clear_previous_app_stubs():
+    for name, module in list(sys.modules.items()):
+        if name != "app" and not name.startswith("app."):
+            continue
+        if getattr(module, "__file__", None) is None and not hasattr(module, "__path__"):
+            sys.modules.pop(name, None)
+
+
+class _DummyConfig:
+    def get_bool(self, _key, default=False):
+        return default
+
+
+_clear_previous_app_stubs()
+
+logger_stub = types.SimpleNamespace(
+    debug=lambda *args, **kwargs: None,
+    warning=lambda *args, **kwargs: None,
+)
+sys.modules["app.platform.logging.logger"] = types.SimpleNamespace(logger=logger_stub)
+sys.modules["app.platform.config.snapshot"] = types.SimpleNamespace(
+    get_config=lambda: _DummyConfig()
+)
+
+from app.dataplane.reverse.protocol.xai_chat import StreamAdapter
+
+
+class StreamAdapterImageCardTests(unittest.TestCase):
+    def test_final_image_chunk_without_url_does_not_raise(self):
+        adapter = StreamAdapter()
+        card = {
+            "id": "image_card",
+            "image_chunk": {
+                "progress": 100,
+                "imageUuid": "image_1",
+                "moderated": False,
+            },
+        }
+        frame = {
+            "result": {
+                "response": {
+                    "cardAttachment": {
+                        "jsonData": json.dumps(card),
+                    }
+                }
+            }
+        }
+
+        events = adapter.feed(json.dumps(frame))
+
+        self.assertEqual([event.kind for event in events], ["image_progress"])
+        self.assertEqual(adapter.image_urls, [])
+
+    def test_image_chunk_accepts_image_url_alias(self):
+        adapter = StreamAdapter()
+        frame = {
+            "result": {
+                "response": {
+                    "cardAttachments": [
+                        {
+                            "jsonData": {
+                                "id": "image_card",
+                                "imageChunk": {
+                                    "progress": 100,
+                                    "imageUuid": "image_2",
+                                    "image_url": "users/user_1/generated/final/image.jpg",
+                                    "moderated": False,
+                                },
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+
+        events = adapter.feed(json.dumps(frame))
+
+        self.assertEqual([event.kind for event in events], ["image_progress", "image"])
+        self.assertEqual(
+            adapter.image_urls,
+            [
+                (
+                    "https://assets.grok.com/users/user_1/generated/final/image.jpg",
+                    "image_2",
+                )
+            ],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
